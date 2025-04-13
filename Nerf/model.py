@@ -5,7 +5,7 @@ from diffusion_guidance.stable_diffusion import StableDiffusion
 from Nerf.PositionalEncoding import PositionalEncoding
 from Nerf.rays import SampleRays
 from Nerf.volume_rendering import VolumeRendering
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 
 scaler = torch.amp.GradScaler()
@@ -47,43 +47,50 @@ class NeRF(nn.Module):
 
         return density, color
 
-def train_step(nerf, ray_o, ray_d, text_embed, sds_model):
-    torch.cuda.empty_cache()
-    
+def train_step(nerf, ray_o, ray_d, text_embed, sds_model, optimizer, scaler):
+    device = ray_o.device
+    ray_o = ray_o.to(device)
+    ray_d = ray_d.to(device)
+    text_embed = text_embed.to(device)
     nerf.train()
-    
-    # ↓ Reduce number of samples per ray
-    num_samples = 32
+    optimizer.zero_grad()
+    torch.cuda.empty_cache()
 
-    # Sample 3D points from rays
+    num_samples = 32
     sample_points = SampleRays.sample_points_along_ray(ray_o, ray_d, num_samples=num_samples)
     dirs = ray_d
 
-    # NeRF Forward
-    sigma, rgb = nerf(sample_points)
+    with autocast(device_type='cuda'):
+        sigma, rgb = nerf(sample_points)
 
-    num_rays = ray_o.shape[0]
-    sigma = sigma.view(num_rays, num_samples)
-    rgb = rgb.view(num_rays, num_samples, 3)
+        num_rays = ray_o.shape[0]
+        H = W = int(num_rays ** 0.5)
+        assert H * W == num_rays, f"num_rays {num_rays} must be a perfect square"
 
-    # Z values for volume rendering
-    z_vals = torch.linspace(0.1, 5.0, num_samples, device=ray_o.device)
-    z_vals = z_vals.expand(num_rays, num_samples)
+        sigma = sigma.view(num_rays, num_samples)
+        rgb = rgb.view(num_rays, num_samples, 3)
 
-    # Volume Rendering
-    rgb_map, weights = VolumeRendering.volume_render_radiance(rgb, sigma, z_vals, dirs)
-    rgb_map.requires_grad_()
+        z_vals = torch.linspace(0.1, 5.0, num_samples, device=device).expand(num_rays, num_samples)
+        rgb_map, weights = VolumeRendering.volume_render_radiance(rgb, sigma, z_vals, dirs)
 
-    H, W = 32, 32
-    rgb_image = rgb_map.view(1, H, W, 3).permute(0, 3, 1, 2)
+        rgb_map = torch.clamp(rgb_map, 0.0, 1.0)
 
-    vae_dtype = next(sds_model.vae.parameters()).dtype
-    rgb_image = rgb_image.to(dtype=vae_dtype)
+        rgb_image = rgb_map.view(1, H, W, 3).permute(0, 3, 1, 2).to(device)
 
-    with torch.no_grad():
-        latents = sds_model.vae.encode(rgb_image * 0.5 + 0.5).latent_dist.sample()
+        vae_dtype = next(sds_model.vae.parameters()).dtype
+        rgb_image = rgb_image.to(dtype=vae_dtype)
 
-    loss = sds_model.get_sds_loss_from_latents(latents, text_embed)
-    loss.backward()
+        latents = sds_model.encode_latents(rgb_image)
 
-    return loss.item(), rgb_map.detach()
+        loss = sds_model.get_sds_loss(latents, text_embed)
+
+    scaler.scale(loss).backward()
+
+    scaler.unscale_(optimizer)
+    
+    torch.nn.utils.clip_grad_norm_(nerf.parameters(), max_norm=1.0)
+
+    scaler.step(optimizer)
+    scaler.update()
+
+    return loss.item(), rgb_map
